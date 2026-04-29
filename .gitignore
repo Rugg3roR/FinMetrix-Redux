@@ -1,0 +1,40 @@
+# ============================================================
+# FinMetrix .gitignore
+# Public: finmetrix.py, README.md, LICENSE
+# Private: modules/, research/, data/
+# ============================================================
+
+# Strategy modules — private
+modules/
+
+# Research pipeline — private
+research/
+
+# All data files — never commit trading data or model artefacts
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Environment / secrets
+.env
+*.env
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Marimo cache
+.marimo/
