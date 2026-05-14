@@ -31,7 +31,6 @@ def _():
     acc     = mt5.account_info()
     balance = acc.balance if acc else 0.0
 
-    # 3-minute refresh — catches new H1 candles within minutes of close
     refresh_timer = mo.ui.refresh(
         options=["1m", "3m", "5m", "10m"],
         default_interval="3m"
@@ -65,148 +64,86 @@ def _():
 @app.cell
 def _(ThreadPoolExecutor, cfg, ft, je, mh, mo, mt5, np, pl):
     """
-    Boot cell — no refresh_timer dependency so runs exactly once.
+    Boot cell — runs once at startup, no refresh dependency.
 
-    1. Fetches 14-day ADR for all 28 pairs (D1 bars)
-    2. Fetches D1 history for HTF persistence features
-    3. Trains three XGBoost models on H1 history:
-         model_long  — predicts target_long  (prob_win for longs)
-         model_short — predicts target_short (prob_win for shorts)
-         model_veto  — predicts target_fail_* (prob of fast failure)
-                       trained on signal-matching rows from both
-                       directions combined; direction-agnostic by design
-                       because "bad trade conditions" are not directional
-    4. Computes Kelly risk % from trade journal
+    1. Fetches D1 bars for ADR calculation (14-day average daily range)
+    2. Trains model_long and model_short (kept for logging/future use —
+       NOT used to gate signals in this version)
+    3. Computes Kelly risk % from trade journal
     """
     with mo.status.spinner("Booting FinMetrix..."):
         from modules.data_engine import get_mt5_df
 
-        # ── D1 fetch helper ───────────────────────────────────────────────────
-        # Used for both ADR calculation and D1 persistence features.
-        # Fetched once per symbol and shared between both uses.
-        def _fetch_d1(symbol):
+        # ── ADR fetch ─────────────────────────────────────────────────────────
+        def _fetch_adr(symbol):
             rates = mt5.copy_rates_from_pos(
-                symbol, mt5.TIMEFRAME_D1, 0, cfg.D1_BARS
+                symbol, mt5.TIMEFRAME_D1, 0, cfg.ADR_LOOKBACK_DAYS
             )
             if rates is None or len(rates) == 0:
-                return symbol, None
-            df = (
-                pl.DataFrame(rates)
-                .with_columns([
-                    pl.from_epoch("time").alias("time"),
-                    pl.col("open", "high", "low", "close").cast(pl.Float64),
-                    pl.col("tick_volume").cast(pl.Float64),
-                ])
-            )
-            return symbol, df
+                return symbol, None, None
+            _info = mt5.symbol_info(symbol)
+            if _info is None:
+                return symbol, None, None
+            _pip_size  = _info.point * (10.0 if _info.digits in [3, 5] else 1.0)
+            _df        = pl.DataFrame(rates)
+            _adr_price = float((_df["high"] - _df["low"]).mean())
+            _adr_pips  = round(_adr_price / _pip_size, 1)
+            return symbol, _adr_price, _adr_pips
 
         with ThreadPoolExecutor(max_workers=8) as _ex:
-            _d1_res = list(_ex.map(_fetch_d1, cfg.SYMBOLS))
+            _adr_res = list(_ex.map(_fetch_adr, cfg.SYMBOLS))
 
-        d1_map = {sym: df for sym, df in _d1_res if df is not None}
-
-        # ── ADR calculation from D1 data ──────────────────────────────────────
         adr_map      = {}
         adr_pips_map = {}
-        for _sym, _d1 in d1_map.items():
-            _info = mt5.symbol_info(_sym)
-            if _info is None or _d1 is None:
-                continue
-            _pip_size  = _info.point * (10.0 if _info.digits in [3, 5] else 1.0)
-            _adr_price = float(
-                (_d1["high"] - _d1["low"]).tail(cfg.ADR_LOOKBACK_DAYS).mean()
-            )
-            adr_map[_sym]      = _adr_price
-            adr_pips_map[_sym] = round(_adr_price / _pip_size, 1)
+        for _sym, _ap, _apips in _adr_res:
+            if _ap is not None:
+                adr_map[_sym]      = _ap
+                adr_pips_map[_sym] = _apips
 
-        # ── Model training ────────────────────────────────────────────────────
+        # ── Model training (informational — not gating signals) ───────────────
+        # Models are trained and their probabilities shown in the dashboard
+        # so you can observe how they correlate with outcomes over time.
+        # They do NOT block or require signals in the current version.
         _long_rows  = []
         _short_rows = []
-        _fail_rows  = []   # combined long + short fail-fast rows for model_veto
-        _rsi_l_min  = cfg.RSI_MID + cfg.RSI_BUFFER
-        _rsi_s_max  = cfg.RSI_MID - cfg.RSI_BUFFER
 
         for _symbol in cfg.SYMBOLS:
-            _h1 = get_mt5_df(_symbol, cfg.TIMEFRAME, cfg.BARS)
-            if _h1 is None:
+            _df = get_mt5_df(_symbol, cfg.TIMEFRAME, cfg.BARS)
+            if _df is None:
                 continue
-
-            # Pass D1 data for this symbol so engineer_features can compute
-            # the D1 persistence feature family (d1_persist_3 etc.)
-            _d1 = d1_map.get(_symbol)
-            _df = ft.engineer_features(_h1, _d1)
+            _df = ft.engineer_features(_df)
             _df = ft.triple_barrier(
                 _df,
                 tp_mult=cfg.TP1_MULT,
                 sl_mult=cfg.SL_MULT,
                 max_hold=cfg.MAX_HOLD,
             )
-
-            # ── Long model training rows ──────────────────────────────────────
+            # Train on EMA-aligned + ADX-trending rows (relaxed — just
+            # needs to be directionally aligned, no RSI/vol constraint)
             _df_long = _df.filter(
-                (pl.col("ema144_slope")     >  cfg.EMA144_SLOPE_MIN) &
-                (pl.col("adx")              >  cfg.ADX_MIN) &
-                (pl.col("pred_alignment")   >= cfg.PRED_ALIGN_LONG) &
-                (pl.col("pred_align_delta") >= cfg.PRED_ALIGN_DELTA_MIN) &
-                (pl.col("rsi_ma")           >  _rsi_l_min) &
-                (pl.col("vol_ratio")        >  1.0)
+                (pl.col("ema144_slope")   > 0) &
+                (pl.col("adx")            > cfg.ADX_MIN) &
+                (pl.col("pred_alignment") >= 2)
             ).select([*cfg.FEATURES, "target_long"]).drop_nulls()
 
-            # ── Short model training rows ─────────────────────────────────────
             _df_short = _df.filter(
-                (pl.col("ema144_slope")     <  -cfg.EMA144_SLOPE_MIN) &
-                (pl.col("adx")              >  cfg.ADX_MIN) &
-                (pl.col("pred_alignment")   <= cfg.PRED_ALIGN_SHORT) &
-                (pl.col("pred_align_delta") <= -cfg.PRED_ALIGN_DELTA_MIN) &
-                (pl.col("rsi_ma")           <  _rsi_s_max) &
-                (pl.col("vol_ratio")        >  1.0)
+                (pl.col("ema144_slope")   < 0) &
+                (pl.col("adx")            > cfg.ADX_MIN) &
+                (pl.col("pred_alignment") <= 2)
             ).select([*cfg.FEATURES, "target_short"]).drop_nulls()
-
-            # ── Veto model training rows ──────────────────────────────────────
-            # Trained on ALL signal-matching rows (long + short combined).
-            # Fail-fast is direction-agnostic — the market conditions that
-            # cause violent rejection are symmetric. Combining both directions
-            # doubles the training set and improves generalisation.
-            # Target column: target_fail_long for long rows, target_fail_short
-            # for short rows — renamed to a unified "target_fail" column.
-            _df_fail_l = _df.filter(
-                (pl.col("ema144_slope")     >  cfg.EMA144_SLOPE_MIN) &
-                (pl.col("adx")             >  cfg.ADX_MIN) &
-                (pl.col("pred_alignment")  >= cfg.PRED_ALIGN_LONG) &
-                (pl.col("pred_align_delta")>= cfg.PRED_ALIGN_DELTA_MIN) &
-                (pl.col("rsi_ma")          >  _rsi_l_min) &
-                (pl.col("vol_ratio")       >  1.0)
-            ).select([*cfg.VETO_FEATURES, "target_fail_long"]).drop_nulls() \
-             .rename({"target_fail_long": "target_fail"})
-
-            _df_fail_s = _df.filter(
-                (pl.col("ema144_slope")     <  -cfg.EMA144_SLOPE_MIN) &
-                (pl.col("adx")             >  cfg.ADX_MIN) &
-                (pl.col("pred_alignment")  <= cfg.PRED_ALIGN_SHORT) &
-                (pl.col("pred_align_delta")<= -cfg.PRED_ALIGN_DELTA_MIN) &
-                (pl.col("rsi_ma")          <  _rsi_s_max) &
-                (pl.col("vol_ratio")       >  1.0)
-            ).select([*cfg.VETO_FEATURES, "target_fail_short"]).drop_nulls() \
-             .rename({"target_fail_short": "target_fail"})
 
             if _df_long.height > 0:
                 _long_rows.append(_df_long.cast(pl.Float64).to_numpy())
             if _df_short.height > 0:
                 _short_rows.append(_df_short.cast(pl.Float64).to_numpy())
-            if _df_fail_l.height > 0:
-                _fail_rows.append(_df_fail_l.cast(pl.Float64).to_numpy())
-            if _df_fail_s.height > 0:
-                _fail_rows.append(_df_fail_s.cast(pl.Float64).to_numpy())
 
-        # ── Fit model_long ────────────────────────────────────────────────────
-        model_long = None
-        _n_long    = 0
+        model_long  = None
+        _n_long     = 0
         if _long_rows:
             _data_l    = np.vstack(_long_rows)
             _n_long    = len(_data_l)
             model_long = mh.train_model(_data_l[:, :-1], _data_l[:, -1])
 
-        # ── Fit model_short ───────────────────────────────────────────────────
         model_short = None
         _n_short    = 0
         if _short_rows:
@@ -214,53 +151,25 @@ def _(ThreadPoolExecutor, cfg, ft, je, mh, mo, mt5, np, pl):
             _n_short    = len(_data_s)
             model_short = mh.train_model(_data_s[:, :-1], _data_s[:, -1])
 
-        # ── Fit model_veto ────────────────────────────────────────────────────
-        # Uses the same XGB hyperparameters as long/short models.
-        # scale_pos_weight is inherited from config — fail-fast labels are
-        # typically minority class (~20-40% of signal rows), so the
-        # existing imbalance correction applies naturally.
-        model_veto = None
-        _n_veto    = 0
-        if _fail_rows:
-            _data_v    = np.vstack(_fail_rows)
-            _n_veto    = len(_data_v)
-            model_veto = mh.train_model(_data_v[:, :-1], _data_v[:, -1])
-
     # ── Kelly ─────────────────────────────────────────────────────────────────
     kelly_risk_pct = je.calculate_adaptive_risk()
     _kelly_src     = "adaptive" if kelly_risk_pct > cfg.KELLY_MIN_FLOOR else "floor"
 
-    # ── Veto class balance diagnostic ─────────────────────────────────────────
-    _veto_pos_pct = 0.0
-    if _fail_rows and _n_veto > 0:
-        _all_labels   = np.vstack(_fail_rows)[:, -1]
-        _veto_pos_pct = float(_all_labels.mean() * 100)
-
     mo.md(f"""
-    ✅ **FinMetrix ready** — H1 candles · 6-gate signal · ADX > {cfg.ADX_MIN}
+    ✅ **FinMetrix ready** — H1 candles · 3-gate signal (EMA + RSI MA cross + ADX)
 
     | | |
     | :--- | :--- |
     | **Long training rows** | {_n_long:,} |
     | **Short training rows** | {_n_short:,} |
-    | **Veto training rows** | {_n_veto:,} (fail-fast rate: {_veto_pos_pct:.1f}%) |
-    | **D1 symbols loaded** | {len(d1_map)} / {len(cfg.SYMBOLS)} |
     | **ADR symbols** | {len(adr_map)} / {len(cfg.SYMBOLS)} |
     | **Kelly risk** | {kelly_risk_pct*100:.2f}% ({_kelly_src}) |
     | **SL / TP1 / TP2** | {cfg.SL_ADR_FRACTION*100:.0f}% / {cfg.TP1_ADR_FRACTION*100:.0f}% / {cfg.TP2_ADR_FRACTION*100:.0f}% of {cfg.ADR_LOOKBACK_DAYS}-day ADR |
-    | **Signal age limit** | {cfg.MAX_SIGNAL_AGE} bars ({cfg.MAX_SIGNAL_AGE}h on H1) |
-    | **Cooldown** | {cfg.COOLDOWN_BARS} bars ({cfg.COOLDOWN_BARS}h on H1) |
-    | **Min edge score** | {cfg.MIN_EDGE_SCORE} (prob_win − prob_veto) |
+    | **Cooldown** | {cfg.COOLDOWN_BARS}h after signal fires |
+    | **Signal gates** | ADX > {cfg.ADX_MIN} · EMA alignment · RSI MA(4) > RSI MA(21) |
+    | **ML prob** | Displayed only — not gating signals |
     """)
-    return (
-        adr_map,
-        adr_pips_map,
-        d1_map,
-        kelly_risk_pct,
-        model_long,
-        model_short,
-        model_veto,
-    )
+    return adr_map, adr_pips_map, kelly_risk_pct, model_long, model_short
 
 
 @app.cell
@@ -270,7 +179,6 @@ def _(
     adr_pips_map,
     balance,
     cfg,
-    d1_map,
     datetime,
     de,
     ft,
@@ -278,7 +186,6 @@ def _(
     kelly_risk_pct,
     model_long,
     model_short,
-    model_veto,
     mt5,
     np,
     refresh_timer,
@@ -287,17 +194,18 @@ def _(
 ):
     refresh_timer.value
 
+    # ── RSI dual MA periods — matches the overlay exactly ────────────────────
+    # RSI fast MA (4) crosses above RSI slow MA (21) → bullish momentum
+    # RSI fast MA (4) crosses below RSI slow MA (21) → bearish momentum
+    _RSI_FAST = 4
+    _RSI_SLOW = 21
+
     # ── Fetch H1 data ─────────────────────────────────────────────────────────
-    # D1 features for the live scanner use the boot-time d1_map.
-    # The D1 data is already shifted by 1 day inside _compute_d1_features,
-    # so the previous day's D1 close is always what's reflected in the
-    # current H1 bar's d1_* columns. No intraday refresh of D1 is needed.
     def _fetch(symbol):
-        df = de.get_mt5_df(symbol, cfg.TIMEFRAME, cfg.BARS)
-        if df is None:
+        _df = de.get_mt5_df(symbol, cfg.TIMEFRAME, cfg.BARS)
+        if _df is None:
             return None
-        _d1 = d1_map.get(symbol)
-        return symbol, ft.engineer_features_fast(df, _d1)
+        return symbol, ft.engineer_features_fast(_df)
 
     with ThreadPoolExecutor(max_workers=8) as _ex:
         _raw = list(_ex.map(_fetch, cfg.SYMBOLS))
@@ -314,7 +222,7 @@ def _(
         if scan_market:
             cfg.LAST_CANDLE_FILE.write_text(str(_last))
 
-    # ── Cooldown ──────────────────────────────────────────────────────────────
+    # ── Cooldown decay on new candle only ─────────────────────────────────────
     _cd = get_cooldown()
     if scan_market:
         _cd = {s: c - 1 for s, c in _cd.items() if c > 1}
@@ -330,44 +238,56 @@ def _(
             return False
         return symbol[:3] in _exposed_curr or symbol[3:6] in _exposed_curr
 
-    # ── Thresholds ────────────────────────────────────────────────────────────
-    _rsi_l_min = cfg.RSI_MID + cfg.RSI_BUFFER
-    _rsi_s_max = cfg.RSI_MID - cfg.RSI_BUFFER
+    # ── RSI dual MA helper ────────────────────────────────────────────────────
+    # Computes fast and slow moving averages of the RSI series.
+    # Returns (rsi_fast_ma, rsi_slow_ma) from the last bar.
+    # Uses a simple rolling mean on the rsi column from engineer_features.
+    def _rsi_dual_ma(df):
+        rsi_arr = df["rsi"].to_numpy()
+        n       = len(rsi_arr)
+        if n < _RSI_SLOW:
+            return 50.0, 50.0
+        fast = float(np.mean(rsi_arr[-_RSI_FAST:])) if n >= _RSI_FAST else 50.0
+        slow = float(np.mean(rsi_arr[-_RSI_SLOW:]))
+        return fast, slow
 
-    # ── Signal age helper ─────────────────────────────────────────────────────
-    def _age(df, direction):
-        tail = df.tail(cfg.MAX_SIGNAL_AGE + 2)
-        n    = tail.height
-        rows = tail.to_dicts()
-        if direction == "long":
-            cond = [
-                r.get("ema144_slope",     0)   >  cfg.EMA144_SLOPE_MIN and
-                r.get("adx",              0)   >  cfg.ADX_MIN and
-                r.get("pred_alignment",   2.0) >= cfg.PRED_ALIGN_LONG and
-                r.get("pred_align_delta", 0)   >= cfg.PRED_ALIGN_DELTA_MIN and
-                r.get("rsi_ma",           50)  >  _rsi_l_min and
-                r.get("vol_ratio",        0)   >  1.0
-                for r in rows
-            ]
-        else:
-            cond = [
-                r.get("ema144_slope",     0)   <  -cfg.EMA144_SLOPE_MIN and
-                r.get("adx",              0)   >  cfg.ADX_MIN and
-                r.get("pred_alignment",   2.0) <= cfg.PRED_ALIGN_SHORT and
-                r.get("pred_align_delta", 0)   <= -cfg.PRED_ALIGN_DELTA_MIN and
-                r.get("rsi_ma",           50)  <  _rsi_s_max and
-                r.get("vol_ratio",        0)   >  1.0
-                for r in rows
-            ]
-        if not cond[-1]:
-            return -1
-        run_start = n - 1
-        for i in range(n - 2, -1, -1):
-            if cond[i]:
-                run_start = i
-            else:
-                break
-        return (n - 1) - run_start
+    # ── ATR regime helper (mirrors overlay) ───────────────────────────────────
+    # Returns "EXPANSION", "COMPRESSION", or "NORMAL"
+    def _regime(df):
+        atr_arr = df["atr"].drop_nulls().to_numpy()
+        if len(atr_arr) < 21:
+            return "NORMAL"
+        current = atr_arr[-1]
+        avg     = float(np.mean(atr_arr[-20:]))
+        if avg == 0:
+            return "NORMAL"
+        if current > avg * 1.3:
+            return "EXPANSION"
+        if current < avg * 0.7:
+            return "COMPRESSION"
+        return "NORMAL"
+
+    # ── Trade Appeal score (mirrors overlay logic) ────────────────────────────
+    # Score 0-100. Informational — you decide whether to act on it.
+    # Components match the overlay: trend, RSI MA cross, volume, candle
+    # completion approximation, and regime.
+    def _appeal(trend_aligned, rsi_fast, rsi_slow, vol_ratio, regime_str):
+        score = 50
+        if trend_aligned:
+            score += 15
+        # RSI MA cross in the right direction
+        rsi_cross_ok = (rsi_fast > rsi_slow) if trend_aligned else (rsi_fast < rsi_slow)
+        if rsi_cross_ok:
+            score += 15
+        # Volume expanding
+        if vol_ratio > 1.0:
+            score += 15
+        # Regime
+        if regime_str == "EXPANSION":
+            score += 10
+        elif regime_str == "COMPRESSION":
+            score -= 10
+        return max(0, min(100, score))
 
     # ── Score every pair ──────────────────────────────────────────────────────
     signal_rows = []
@@ -376,95 +296,84 @@ def _(
 
     for symbol, df in results:
         now = df.tail(1).to_dicts()[0]
-        X   = np.array([[now.get(f, 0.0) for f in cfg.FEATURES]])
 
-        # Directional win probabilities
-        prob_l = float(model_long.predict_proba(X)[0][1])  if model_long  else 0.0
-        prob_s = float(model_short.predict_proba(X)[0][1]) if model_short else 0.0
-
-        # Veto probability — probability of fast failure given current context.
-        # Uses VETO_FEATURES (same as FEATURES for now; can diverge later).
-        X_veto   = np.array([[now.get(f, 0.0) for f in cfg.VETO_FEATURES]])
-        prob_veto = float(model_veto.predict_proba(X_veto)[0][1]) if model_veto else 0.0
-
-        # Edge scores — net signal quality after subtracting failure risk
-        edge_l = prob_l - prob_veto
-        edge_s = prob_s - prob_veto
-
+        # ── Core indicator values ─────────────────────────────────────────────
         ema144_slope = now.get("ema144_slope",    0.0)
         adx          = now.get("adx",             0.0)
         pred_align   = now.get("pred_alignment",  2.0)
-        pred_delta   = now.get("pred_align_delta",0.0)
-        rsi_ma       = now.get("rsi_ma",          50.0)
+        rsi_ma_val   = now.get("rsi_ma",          50.0)
         vol_ratio    = now.get("vol_ratio",        1.0)
         price        = now.get("close",            0.0)
 
-        # D1 context values for display
-        d1_persist   = now.get("d1_persist_3",      0.0)
-        d1_adx       = now.get("d1_adx",            20.0)
+        # RSI dual MA cross (4-period vs 21-period of raw RSI)
+        rsi_fast, rsi_slow = _rsi_dual_ma(df)
+        rsi_bull = rsi_fast > rsi_slow   # bullish RSI momentum
+        rsi_bear = rsi_fast < rsi_slow   # bearish RSI momentum
 
-        # Gate checks — 6 gates each direction (unchanged)
-        g_trend_l = ema144_slope >  cfg.EMA144_SLOPE_MIN
-        g_trend_s = ema144_slope < -cfg.EMA144_SLOPE_MIN
-        g_adx     = adx          >  cfg.ADX_MIN
-        g_align_l = pred_align   >= cfg.PRED_ALIGN_LONG
-        g_align_s = pred_align   <= cfg.PRED_ALIGN_SHORT
-        g_delta_l = pred_delta   >= cfg.PRED_ALIGN_DELTA_MIN
-        g_delta_s = pred_delta   <= -cfg.PRED_ALIGN_DELTA_MIN
-        g_rsi_l   = rsi_ma       >  _rsi_l_min
-        g_rsi_s   = rsi_ma       <  _rsi_s_max
-        g_vol     = vol_ratio    >  1.0
+        # Regime and appeal
+        regime_str = _regime(df)
 
-        is_long  = g_trend_l and g_adx and g_align_l and g_delta_l and g_rsi_l and g_vol
-        is_short = g_trend_s and g_adx and g_align_s and g_delta_s and g_rsi_s and g_vol
+        # ── THREE signal gates ────────────────────────────────────────────────
+        # Gate 1 — ADX: market is actually trending, not ranging
+        # Gate 2 — EMA alignment: pred_alignment direction
+        # Gate 3 — RSI MA cross: fast RSI MA aligned with direction
+        #
+        # These three must ALL pass. No ML gate. No vol gate. No delta gate.
+        # You apply your own discretion on top using the Appeal score and
+        # the additional columns shown in the dashboard.
 
-        # Gate flag strings — 6 chars: Trend | ADX | Align | Delta | RSI | Vol
+        g_adx     = adx > cfg.ADX_MIN           # ADX > 20
+        g_align_l = pred_align >= 2              # at least 2 of 4 EMA pairs bullish
+        g_align_s = pred_align <= 2              # at least 2 of 4 EMA pairs bearish
+        g_trend_l = ema144_slope > 0             # EMA144 pointing up
+        g_trend_s = ema144_slope < 0             # EMA144 pointing down
+        g_rsi_l   = rsi_bull                     # RSI fast MA > RSI slow MA
+        g_rsi_s   = rsi_bear                     # RSI fast MA < RSI slow MA
+
+        is_long  = g_adx and g_trend_l and g_align_l and g_rsi_l
+        is_short = g_adx and g_trend_s and g_align_s and g_rsi_s
+
+        # Gate flags for display — 4 chars: ADX | Trend | Align | RSI cross
         flags_l = "".join([
-            "T" if g_trend_l else ".",
             "X" if g_adx     else ".",
+            "T" if g_trend_l else ".",
             "A" if g_align_l else ".",
-            "D" if g_delta_l else ".",
             "R" if g_rsi_l   else ".",
-            "V" if g_vol     else ".",
         ])
         flags_s = "".join([
-            "T" if g_trend_s else ".",
             "X" if g_adx     else ".",
+            "T" if g_trend_s else ".",
             "A" if g_align_s else ".",
-            "D" if g_delta_s else ".",
             "R" if g_rsi_s   else ".",
-            "V" if g_vol     else ".",
         ])
 
+        # Appeal score for display
+        _appeal_l = _appeal(g_trend_l and g_align_l, rsi_fast, rsi_slow,
+                            vol_ratio, regime_str)
+        _appeal_s = _appeal(g_trend_s and g_align_s, rsi_fast, rsi_slow,
+                            vol_ratio, regime_str)
+        appeal_score = _appeal_l if (is_long or g_trend_l) else _appeal_s
+
+        # ── ML probability (informational only) ───────────────────────────────
+        _X     = np.array([[now.get(f, 0.0) for f in cfg.FEATURES]])
+        prob_l = float(model_long.predict_proba(_X)[0][1])  if model_long  else 0.0
+        prob_s = float(model_short.predict_proba(_X)[0][1]) if model_short else 0.0
+
+        # ── Signal decision ───────────────────────────────────────────────────
         corr_blocked = _blocked(symbol)
         in_cooldown  = symbol in _cd
         signal       = "Neutral"
         prob         = max(prob_l, prob_s)
-        edge_score   = 0.0
-        age          = -1
 
         if is_long and not in_cooldown and not corr_blocked:
-            age = _age(df, "long")
-            # Signal fires only if both raw prob AND edge score clear their
-            # respective thresholds. MIN_EDGE_SCORE = 0.0 in config so the
-            # veto has no blocking effect until it's been calibrated.
-            if (0 <= age <= cfg.MAX_SIGNAL_AGE
-                    and prob_l >= cfg.MIN_PROB
-                    and edge_l >= cfg.MIN_EDGE_SCORE):
-                signal     = "BUY"
-                prob       = prob_l
-                edge_score = edge_l
+            signal = "BUY"
+            prob   = prob_l
 
         elif is_short and not in_cooldown and not corr_blocked:
-            age = _age(df, "short")
-            if (0 <= age <= cfg.MAX_SIGNAL_AGE
-                    and prob_s >= cfg.MIN_PROB
-                    and edge_s >= cfg.MIN_EDGE_SCORE):
-                signal     = "SELL"
-                prob       = prob_s
-                edge_score = edge_s
+            signal = "SELL"
+            prob   = prob_s
 
-        # ── SL / TP / Lot — always calculated ────────────────────────────────
+        # ── SL / TP / Lot sizing ──────────────────────────────────────────────
         adr   = adr_map.get(symbol)
         adr_p = adr_pips_map.get(symbol, 0.0)
 
@@ -479,13 +388,10 @@ def _(
             tp2_dist = _atr * cfg.TP2_MULT
             adr_p    = 0.0
 
-        if signal == "BUY":
+        # Always show levels based on likely direction
+        if signal == "BUY" or (signal == "Neutral" and g_trend_l and g_align_l):
             _dir = "BUY"
-        elif signal == "SELL":
-            _dir = "SELL"
-        elif ema144_slope > 0 and pred_align >= 3:
-            _dir = "BUY"
-        elif ema144_slope < 0 and pred_align <= 1:
+        elif signal == "SELL" or (signal == "Neutral" and g_trend_s and g_align_s):
             _dir = "SELL"
         else:
             _dir = "—"
@@ -507,13 +413,13 @@ def _(
 
         _info = mt5.symbol_info(symbol)
         if _info and sl_dist > 0:
-            sl_in_ticks = sl_dist / _info.trade_tick_size
-            lot_size    = (balance * kelly_risk_pct) / (sl_in_ticks * _info.trade_tick_value)
-            lot_size    = max(_info.volume_min,
-                              round(lot_size / _info.volume_step) * _info.volume_step)
-            risk_gbp    = round(lot_size * sl_in_ticks * _info.trade_tick_value, 2)
+            _sl_ticks = sl_dist / _info.trade_tick_size
+            lot_size  = (balance * kelly_risk_pct) / (_sl_ticks * _info.trade_tick_value)
+            lot_size  = max(_info.volume_min,
+                            round(lot_size / _info.volume_step) * _info.volume_step)
+            risk_gbp  = round(lot_size * _sl_ticks * _info.trade_tick_value, 2)
 
-        # ── Log signal on new candle ──────────────────────────────────────────
+        # ── Log signal ────────────────────────────────────────────────────────
         if scan_market and signal != "Neutral":
             today_count += 1
             _cd[symbol] = cfg.COOLDOWN_BARS
@@ -530,11 +436,12 @@ def _(
                 "sl_pips":     sl_pips,
                 "lot_size":    lot_size,
                 "prob":        prob,
-                "prob_veto":   prob_veto,
-                "edge_score":  edge_score,
-                "d1_persist":  d1_persist,
-                "d1_adx":      d1_adx,
-                "signal_age":  age,
+                "appeal":      appeal_score,
+                "rsi_fast":    round(rsi_fast, 2),
+                "rsi_slow":    round(rsi_slow, 2),
+                "regime":      regime_str,
+                "adx":         round(adx, 1),
+                "pred_align":  pred_align,
                 **{f: now.get(f, 0.0) for f in cfg.FEATURES},
             })
 
@@ -546,33 +453,30 @@ def _(
         else:
             tag = ""
 
-        # Veto display: show prob_veto and edge_score for active signals,
-        # prob_veto alone for near-miss rows so you can see what it's doing
-        _veto_str  = f"{prob_veto*100:.0f}%"
-        _edge_str  = f"{edge_score:+.2f}" if signal != "Neutral" else "—"
+        # Appeal colour hint for display
+        _appeal_str = f"{appeal_score}/100"
 
         signal_rows.append({
             "Symbol":    symbol,
             "Signal":    signal + tag,
-            "ADR":       adr_p,
-            "Prob":      f"{prob*100:.0f}%",
-            "Veto":      _veto_str,
-            "Edge":      _edge_str,
+            "ADR pips":  adr_p,
+            "Appeal":    _appeal_str,
+            "Regime":    regime_str,
+            "Price":     round(price, 5),
             "Lot":       round(lot_size, 2),
             "Risk GBP":  risk_gbp,
-            "Price":     round(price, 5),
             "SL":        sl,
             "TP1":       tp1,
             "TP2":       tp2,
-            "D1 bias":   f"{d1_persist:+.2f}",
-            "D1 ADX":    round(d1_adx, 1),
+            "ML prob":   f"{prob*100:.0f}%",
             "Gates L":   flags_l,
-            "Gates S":   flags_s,
+            "Gates S":   flags_s
         })
 
+    # Sort: active signals first, then by appeal score descending
     signal_rows.sort(key=lambda x: (
         x["Signal"].split()[0] not in ("BUY", "SELL"),
-        -float(x["Prob"][:-1])
+        -int(x["Appeal"].split("/")[0])
     ))
     return signal_rows, today_count
 
@@ -597,11 +501,13 @@ def _(
             f"Kelly: {kelly_risk_pct*100:.2f}%"
         ),
         mo.md(
-            f"Gates: **T**rend(ema144) · **X**(ADX>{cfg.ADX_MIN}) · "
-            f"**A**lign · **D**elta · **R**SI_MA · **V**ol  |  "
-            f"[exp]=currency exposure block · [cdN]=cooldown bars remaining  |  "
-            f"**Veto**=fail-fast prob · **Edge**=prob_win−prob_veto "
-            f"(min {cfg.MIN_EDGE_SCORE:+.2f})"
+            f"**Gates (all 3 must pass):** "
+            f"**X** ADX>{cfg.ADX_MIN} · "
+            f"**T** EMA144 slope · "
+            f"**A** EMA alignment (pred) · "
+            f"**R** RSI MA(4) x RSI MA(21)  |  "
+            f"[exp]=currency blocked · [cdN]=cooldown  |  "
+            f"**Appeal** 0–100: use for discretion (≥80 = favourable, ≤50 = caution)"
         ),
         mo.ui.table(signal_rows, pagination=False),
     ])
@@ -663,8 +569,7 @@ def _(adr_map, cfg, datetime, mo, mt5, refresh_timer, timezone):
                     _tp2_hit = _price <= _tp2_p
 
                 _sl_pips = round(_sl_d / _pip, 1)
-
-                _action    = "Hold"
+                _action  = "Hold"
                 _auto_done = False
 
                 if _tp2_hit and _info:
@@ -718,13 +623,13 @@ def _(adr_map, cfg, datetime, mo, mt5, refresh_timer, timezone):
                         _action = "Under pressure"
 
                 _rows.append({
-                    "Symbol":   _sym,   "Side":      _side,
-                    "Lots":     _lots,  "Entry":     round(_entry, 5),
+                    "Symbol":   _sym,    "Side":      _side,
+                    "Lots":     _lots,   "Entry":     round(_entry, 5),
                     "Now":      round(_price, 5),
-                    "R":        _r,     "SL pips":   _sl_pips,
+                    "R":        _r,      "SL pips":   _sl_pips,
                     "SL":       round(_sl, 5) if _sl else "—",
                     "BE":       round(_entry, 5),
-                    "TP1(50%)": _tp1_p, "TP2(25%)": _tp2_p,
+                    "TP1(50%)": _tp1_p,  "TP2(25%)":  _tp2_p,
                     "Trail":    _trail,
                     "TP1 hit":  "✅" if _tp1_hit else "—",
                     "TP2 hit":  "✅" if _tp2_hit else "—",
@@ -734,13 +639,13 @@ def _(adr_map, cfg, datetime, mo, mt5, refresh_timer, timezone):
             else:
                 _rows.append({
                     "Symbol":   _sym,  "Side":      _side,
-                    "Lots":     _lots, "Entry":     round(_entry, 5),
+                    "Lots":     _lots, "Entry":      round(_entry, 5),
                     "Now":      round(_price, 5),
-                    "R":        "—",   "SL pips":   "—",
+                    "R":        "—",   "SL pips":    "—",
                     "SL":       "SET SL FIRST",
-                    "BE":       "—",   "TP1(50%)":  "—",
-                    "TP2(25%)": "—",   "Trail":     "—",
-                    "TP1 hit":  "—",   "TP2 hit":   "—",
+                    "BE":       "—",   "TP1(50%)":   "—",
+                    "TP2(25%)": "—",   "Trail":       "—",
+                    "TP1 hit":  "—",   "TP2 hit":     "—",
                     "P&L":      round(_pnl, 2),
                     "Action":   "SET SL FIRST",
                 })
